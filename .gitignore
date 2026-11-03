@@ -1,0 +1,39 @@
+# ============================================================
+# ESP-SWITCH5 REMOTE
+# ============================================================
+
+# Local configuration
+.env
+.env.*
+!.env.example
+
+# PHP temporary files
+*.log
+
+# Operating system files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Windows temporary files
+*.tmp
+*.temp
+
+# Editor files
+.vscode/
+.idea/
+
+# Arduino temporary/build files
+build/
+*.hex
+*.bin
+*.elf
+*.map
+
+# Backup files
+*.bak
+*.old
+*~
+
+# Local XAMPP files
+xampp/
