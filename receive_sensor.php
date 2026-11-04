@@ -1,552 +1,303 @@
-<?php
-declare(strict_types=1);
 
-/*
- * Project: datalogger8_remote
- * File: receive_sensor.php
- *
- * Receives readings from ESP0001, ESP0002 and ESP0003.
- * Stores readings in sensor_pending8.
- * Combines all three readings into one logs row.
- */
+<?php
+// receive_sensor.php
+// Receives one reading from each ESP8266 and creates one combined logs row.
 
 header('Content-Type: application/json; charset=utf-8');
-header('Cache-Control: no-store');
-
-date_default_timezone_set('UTC');
-
-function respond(int $status, array $data): void
-{
-    http_response_code($status);
-
-    echo json_encode(
-        $data,
-        JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE
-    );
-
-    exit;
-}
-
-/* POST only */
-
-if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
-    header('Allow: POST');
-
-    respond(405, [
-        'ok' => false,
-        'message' => 'POST requests only'
-    ]);
-}
-
-/* Load database configuration */
 
 require_once __DIR__ . '/config.php';
 
-/* Authenticate controller */
-
-$expectedToken = trim((string)getenv('ESP_API_TOKEN'));
-
-if ($expectedToken === '') {
-    error_log('datalogger8: ESP_API_TOKEN is not configured.');
-
-    respond(500, [
-        'ok' => false,
-        'message' => 'Server API token is not configured'
-    ]);
+function reply($code, $data) {
+    http_response_code($code);
+    echo json_encode($data);
+    exit;
 }
-
-$providedToken = (string)($_SERVER['HTTP_X_API_TOKEN'] ?? '');
-
-if (
-    $providedToken === '' ||
-    !hash_equals($expectedToken, $providedToken)
-) {
-    respond(401, [
-        'ok' => false,
-        'message' => 'Invalid API token'
-    ]);
-}
-
-/* Read JSON */
-
-$raw = file_get_contents('php://input');
-
-if ($raw === false || strlen($raw) > 4096) {
-    respond(400, [
-        'ok' => false,
-        'message' => 'Invalid request body'
-    ]);
-}
-
-$data = json_decode($raw, true);
-
-if (!is_array($data)) {
-    respond(400, [
-        'ok' => false,
-        'message' => 'Valid JSON is required'
-    ]);
-}
-
-/* Validate device ID */
-
-$deviceId = strtoupper(
-    trim((string)($data['device_id'] ?? ''))
-);
-
-$allowedDevices = [
-    'ESP0001',
-    'ESP0002',
-    'ESP0003'
-];
-
-if (!in_array($deviceId, $allowedDevices, true)) {
-    respond(400, [
-        'ok' => false,
-        'message' => 'Unknown device ID'
-    ]);
-}
-
-/* Validate sensor value */
-
-$value = $data['value'] ?? null;
-
-if (
-    !is_numeric($value) ||
-    !is_finite((float)$value)
-) {
-    respond(400, [
-        'ok' => false,
-        'message' => 'Invalid sensor value'
-    ]);
-}
-
-$sensorValue = (string)$value;
-
-if (strlen($sensorValue) > 50) {
-    respond(400, [
-        'ok' => false,
-        'message' => 'Sensor value is too long'
-    ]);
-}
-
-/* Validate cycle information */
-
-$cycleId = filter_var(
-    $data['cycle_id'] ?? null,
-    FILTER_VALIDATE_INT
-);
-
-$sampleEpoch = filter_var(
-    $data['sample_epoch'] ?? null,
-    FILTER_VALIDATE_INT
-);
-
-if (
-    $cycleId === false ||
-    $cycleId === null ||
-    $cycleId <= 0 ||
-    $sampleEpoch === false ||
-    $sampleEpoch === null ||
-    $sampleEpoch <= 0
-) {
-    respond(400, [
-        'ok' => false,
-        'message' => 'Invalid cycle_id or sample_epoch'
-    ]);
-}
-
-/* All devices must use the same five-second UTC cycle */
-
-if ($cycleId !== intdiv($sampleEpoch, 5)) {
-    respond(400, [
-        'ok' => false,
-        'message' => 'Cycle ID does not match sample time'
-    ]);
-}
-
-/* Validate timezone */
-
-$timezone = trim((string)($data['timezone'] ?? ''));
 
 try {
-    new DateTimeZone($timezone);
-} catch (Throwable $e) {
-    respond(400, [
-        'ok' => false,
-        'message' => 'Invalid timezone'
-    ]);
-}
-
-/*
- * Live-reading time validation.
- *
- * This retains the existing five-minute old-reading
- * and 30-second future-reading limits.
- *
- * Historical SD card / LittleFS uploads need their own
- * separately designed upload handling if older records
- * are to be accepted.
- */
-
-$now = time();
-
-if (
-    $sampleEpoch < $now - 300 ||
-    $sampleEpoch > $now + 30
-) {
-    respond(400, [
-        'ok' => false,
-        'message' => 'Sample time is outside the allowed window',
-        'server_epoch' => $now,
-        'sample_epoch' => $sampleEpoch
-    ]);
-}
-
-/* Calculate UTC and local time */
-
-$utcDateTime = gmdate('Y-m-d H:i:s', $sampleEpoch);
-
-try {
-    $localDateTime = (new DateTimeImmutable('@' . $sampleEpoch))
-        ->setTimezone(new DateTimeZone($timezone));
-
-    $localDate = $localDateTime->format('Y-m-d');
-    $localTime = $localDateTime->format('H:i:s');
-
-} catch (Throwable $e) {
-    respond(400, [
-        'ok' => false,
-        'message' => 'Unable to calculate local time'
-    ]);
-}
-
-/* Database transaction */
-
-$transactionStarted = false;
-
-try {
-    if (!isset($conn) || !($conn instanceof mysqli)) {
-        throw new RuntimeException(
-            'Database connection is unavailable'
-        );
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        reply(405, ['ok' => false, 'error' => 'POST requests only']);
     }
 
-    $conn->set_charset('utf8mb4');
-    $conn->query("SET time_zone = '+00:00'");
+    $expected = trim((string)getenv('ESP_API_TOKEN'));
+    $provided = trim((string)($_SERVER['HTTP_X_API_TOKEN'] ?? ''));
+
+    if ($expected === '' || !hash_equals($expected, $provided)) {
+        reply(401, ['ok' => false, 'error' => 'Invalid API token']);
+    }
+
+    if (!isset($conn) || !($conn instanceof mysqli)) {
+        throw new Exception('Database connection unavailable');
+    }
+
+    $input = json_decode(file_get_contents('php://input'), true);
+
+    if (!is_array($input)) {
+        reply(400, ['ok' => false, 'error' => 'Invalid JSON']);
+    }
+
+    $device = trim((string)($input['device_id'] ?? ''));
+    $value = trim((string)($input['value'] ?? ''));
+    $cycleId = trim((string)($input['cycle_id'] ?? ''));
+    $sampleEpoch = filter_var(
+        $input['sample_epoch'] ?? null,
+        FILTER_VALIDATE_INT
+    );
+    $timezone = trim((string)($input['timezone'] ?? ''));
+
+    $allowed = ['ESP0001', 'ESP0002', 'ESP0003'];
+
+    if (!in_array($device, $allowed, true)) {
+        reply(400, ['ok' => false, 'error' => 'Unknown device ID']);
+    }
+
+    if ($value === '' || !is_numeric($value) ||
+        strlen($value) > 50) {
+        reply(400, ['ok' => false, 'error' => 'Invalid sensor value']);
+    }
+
+    if ($cycleId === '' || !ctype_digit($cycleId) ||
+        $sampleEpoch === false || $sampleEpoch <= 0) {
+        reply(400, ['ok' => false, 'error' => 'Invalid cycle or sample time']);
+    }
+
+    if ($timezone === '') {
+        reply(400, ['ok' => false, 'error' => 'Timezone is required']);
+    }
+
+    // Validate IANA timezone.
+    try {
+        $tz = new DateTimeZone($timezone);
+    } catch (Throwable $e) {
+        reply(400, ['ok' => false, 'error' => 'Invalid timezone']);
+    }
 
     $conn->begin_transaction();
-    $transactionStarted = true;
 
-    $cycleIdString = (string)$cycleId;
-    $sampleEpochString = (string)$sampleEpoch;
-
-    /*
-     * Create cycle row if absent.
-     */
-
+    // Lock the cycle row while processing this reading.
     $stmt = $conn->prepare(
-        "INSERT INTO sensor_cycles8 (cycle_id, completed)
-         VALUES (?, 0)
-         ON DUPLICATE KEY UPDATE cycle_id = VALUES(cycle_id)"
-    );
-
-    $stmt->bind_param('s', $cycleIdString);
-    $stmt->execute();
-    $stmt->close();
-
-    /*
-     * Lock this cycle during processing.
-     */
-
-    $stmt = $conn->prepare(
-        "SELECT completed
-         FROM sensor_cycles8
+        "SELECT completed, created_at
+         FROM sensor_cycles
          WHERE cycle_id = ?
          FOR UPDATE"
     );
 
-    $stmt->bind_param('s', $cycleIdString);
-    $stmt->execute();
-
-    $cycleResult = $stmt->get_result();
-    $cycleRow = $cycleResult->fetch_assoc();
-
-    $stmt->close();
-
-    if (!$cycleRow) {
-        throw new RuntimeException(
-            'Unable to find collection cycle'
-        );
+    if (!$stmt) {
+        throw new Exception($conn->error);
     }
 
-    if ((int)$cycleRow['completed'] === 1) {
-        $conn->commit();
-        $transactionStarted = false;
+    $stmt->bind_param('i', $cycleId);
+    $stmt->execute();
+    $cycleResult = $stmt->get_result();
+    $cycle = $cycleResult->fetch_assoc();
+    $stmt->close();
 
-        respond(200, [
-            'ok' => true,
-            'cycle_id' => $cycleId,
-            'completed' => true,
-            'message' => 'Cycle already completed'
+    if (!$cycle) {
+        $conn->rollback();
+        reply(409, [
+            'ok' => false,
+            'error' => 'Cycle not found. Obtain a current cycle ID.'
         ]);
     }
 
-    /*
-     * Check whether this controller already submitted
-     * its reading for this cycle.
-     */
-
-    $stmt = $conn->prepare(
-        "SELECT sensor_value, sample_epoch
-         FROM sensor_pending8
-         WHERE cycle_id = ? AND device_id = ?
-         FOR UPDATE"
-    );
-
-    $stmt->bind_param(
-        'ss',
-        $cycleIdString,
-        $deviceId
-    );
-
-    $stmt->execute();
-
-    $existingResult = $stmt->get_result();
-    $existingRow = $existingResult->fetch_assoc();
-
-    $stmt->close();
-
-    if ($existingRow) {
-        if (
-            (string)$existingRow['sensor_value'] !== $sensorValue ||
-            (string)$existingRow['sample_epoch'] !== $sampleEpochString
-        ) {
-            throw new RuntimeException(
-                'Conflicting duplicate reading for this device and cycle'
-            );
-        }
-    } else {
-        /*
-         * Insert this controller's reading.
-         */
-
-        $stmt = $conn->prepare(
-            "INSERT INTO sensor_pending8
-             (cycle_id, device_id, sensor_value,
-              sample_epoch, timezone)
-             VALUES (?, ?, ?, ?, ?)"
-        );
-
-        $stmt->bind_param(
-            'sssss',
-            $cycleIdString,
-            $deviceId,
-            $sensorValue,
-            $sampleEpochString,
-            $timezone
-        );
-
-        $stmt->execute();
-        $stmt->close();
+    if ((int)$cycle['completed'] === 1) {
+        $conn->commit();
+        reply(200, [
+            'ok' => true,
+            'completed' => true,
+            'message' => 'This cycle was already completed'
+        ]);
     }
 
-    /*
-     * Read all submitted readings for this cycle.
-     */
+    // Reject old cycles.
+    $created = strtotime($cycle['created_at']);
+    if ($created === false || (time() - $created) > 120) {
+        $conn->rollback();
+        reply(409, [
+            'ok' => false,
+            'error' => 'Cycle expired. Wait for a new cycle.'
+        ]);
+    }
 
+    // One reading per device per cycle.
+    // A retry from the same device updates its pending reading.
     $stmt = $conn->prepare(
-        "SELECT device_id, sensor_value, sample_epoch, timezone
-         FROM sensor_pending8
-         WHERE cycle_id = ?
-         ORDER BY device_id
-         FOR UPDATE"
+        "INSERT INTO sensor_pending
+            (cycle_id, device_id, sensor_value, sample_epoch, timezone)
+         VALUES (?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+            sensor_value = VALUES(sensor_value),
+            sample_epoch = VALUES(sample_epoch),
+            timezone = VALUES(timezone),
+            received_at = CURRENT_TIMESTAMP"
     );
 
-    $stmt->bind_param('s', $cycleIdString);
-    $stmt->execute();
+    if (!$stmt) {
+        throw new Exception($conn->error);
+    }
 
-    $pendingResult = $stmt->get_result();
+    $stmt->bind_param(
+        'issis',
+        $cycleId,
+        $device,
+        $value,
+        $sampleEpoch,
+        $timezone
+    );
+
+    $stmt->execute();
+    $stmt->close();
+
+    // Count distinct controllers received for this cycle.
+    $stmt = $conn->prepare(
+        "SELECT COUNT(DISTINCT device_id) AS total
+         FROM sensor_pending
+         WHERE cycle_id = ?"
+    );
+
+    if (!$stmt) {
+        throw new Exception($conn->error);
+    }
+
+    $stmt->bind_param('i', $cycleId);
+    $stmt->execute();
+    $countResult = $stmt->get_result();
+    $countRow = $countResult->fetch_assoc();
+    $stmt->close();
+
+    $received = (int)$countRow['total'];
+
+    if ($received < 3) {
+        $conn->commit();
+        reply(200, [
+            'ok' => true,
+            'received' => $received,
+            'required' => 3,
+            'completed' => false,
+            'cycle_id' => $cycleId
+        ]);
+    }
+
+    // Read all three values.
+    $stmt = $conn->prepare(
+        "SELECT device_id, sensor_value, sample_epoch, timezone
+         FROM sensor_pending
+         WHERE cycle_id = ?"
+    );
+
+    if (!$stmt) {
+        throw new Exception($conn->error);
+    }
+
+    $stmt->bind_param('i', $cycleId);
+    $stmt->execute();
+    $rowsResult = $stmt->get_result();
 
     $readings = [];
 
-    while ($row = $pendingResult->fetch_assoc()) {
+    while ($row = $rowsResult->fetch_assoc()) {
         $readings[$row['device_id']] = $row;
     }
 
     $stmt->close();
 
-    /*
-     * Wait until all three controllers have submitted.
-     */
-
-    foreach ($allowedDevices as $requiredDevice) {
+    foreach ($allowed as $requiredDevice) {
         if (!isset($readings[$requiredDevice])) {
             $conn->commit();
-            $transactionStarted = false;
-
-            respond(200, [
+            reply(200, [
                 'ok' => true,
-                'cycle_id' => $cycleId,
-                'device_id' => $deviceId,
                 'received' => count($readings),
                 'required' => 3,
                 'completed' => false,
-                'stored' => true,
-                'message' => 'Reading stored; waiting for other controllers'
+                'cycle_id' => $cycleId
             ]);
         }
     }
 
-    /*
-     * Confirm all three controllers used the same sample time.
-     */
+    // Use ESP0001's sample time and timezone for the combined row.
+    $masterEpoch = (int)$readings['ESP0001']['sample_epoch'];
+    $masterTimezone = $readings['ESP0001']['timezone'];
 
-    foreach ($allowedDevices as $requiredDevice) {
-        if (
-            (string)$readings[$requiredDevice]['sample_epoch'] !==
-            $sampleEpochString
-        ) {
-            throw new RuntimeException(
-                'Controller sample times do not match'
-            );
-        }
-    }
+    $masterTz = new DateTimeZone($masterTimezone);
+    $localTime = new DateTime('@' . $masterEpoch);
+    $localTime->setTimezone($masterTz);
 
-    /*
-     * Use ESP0001 timezone for the combined logs row.
-     */
-
-    $finalTimezone = $readings['ESP0001']['timezone'];
-
-    $finalDateTime = (new DateTimeImmutable('@' . $sampleEpoch))
-        ->setTimezone(new DateTimeZone($finalTimezone));
-
-    $finalDate = $finalDateTime->format('Y-m-d');
-    $finalTime = $finalDateTime->format('H:i:s');
+    $dateValue = $localTime->format('Y-m-d');
+    $timeValue = $localTime->format('H:i:s');
 
     $value1 = $readings['ESP0001']['sensor_value'];
     $value2 = $readings['ESP0002']['sensor_value'];
     $value3 = $readings['ESP0003']['sensor_value'];
 
-    $combinedDeviceId = 'ESP0001,ESP0002,ESP0003';
-
-    /*
-     * Check for an existing combined record at this UTC timestamp.
-     */
-
+    // Exactly one combined row for the three devices.
     $stmt = $conn->prepare(
-        "SELECT id
-         FROM logs
-         WHERE TimeStamp = ?
-           AND device_id = ?
-         LIMIT 1
-         FOR UPDATE"
+        "INSERT INTO logs
+            (value1, value2, value3, Date, Time, timezone, device_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?)"
     );
 
+    if (!$stmt) {
+        throw new Exception($conn->error);
+    }
+
+    $allDevices = 'ESP0001,ESP0002,ESP0003';
+
     $stmt->bind_param(
-        'ss',
-        $utcDateTime,
-        $combinedDeviceId
+        'sssssss',
+        $value1,
+        $value2,
+        $value3,
+        $dateValue,
+        $timeValue,
+        $masterTimezone,
+        $allDevices
     );
 
     $stmt->execute();
-
-    $duplicateResult = $stmt->get_result();
-    $duplicateRow = $duplicateResult->fetch_assoc();
-
+    $logId = $conn->insert_id;
     $stmt->close();
 
-    $logsInserted = false;
-
-    if (!$duplicateRow) {
-        /*
-         * Insert one combined row.
-         * id is omitted because it is AUTO_INCREMENT.
-         */
-
-        $stmt = $conn->prepare(
-            "INSERT INTO logs
-             (value1, value2, value3, `Date`, `Time`,
-              `TimeStamp`, timezone, device_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-        );
-
-        $stmt->bind_param(
-            'ssssssss',
-            $value1,
-            $value2,
-            $value3,
-            $finalDate,
-            $finalTime,
-            $utcDateTime,
-            $finalTimezone,
-            $combinedDeviceId
-        );
-
-        $stmt->execute();
-        $stmt->close();
-
-        $logsInserted = true;
-    }
-
-    /*
-     * Mark cycle complete only after successful insertion
-     * or confirmation that the combined row already exists.
-     */
-
+    // Mark this cycle completed in the same transaction.
     $stmt = $conn->prepare(
-        "UPDATE sensor_cycles8
+        "UPDATE sensor_cycles
          SET completed = 1
          WHERE cycle_id = ?"
     );
 
-    $stmt->bind_param('s', $cycleIdString);
+    if (!$stmt) {
+        throw new Exception($conn->error);
+    }
+
+    $stmt->bind_param('i', $cycleId);
     $stmt->execute();
     $stmt->close();
 
     $conn->commit();
-    $transactionStarted = false;
 
-    respond(200, [
+    reply(200, [
         'ok' => true,
-        'stored' => true,
-        'cycle_id' => $cycleId,
+        'received' => 3,
+        'required' => 3,
         'completed' => true,
-        'message' => 'All three readings combined successfully',
+        'cycle_id' => $cycleId,
+        'log_id' => $logId,
         'value1' => $value1,
         'value2' => $value2,
         'value3' => $value3,
-        'timestamp_utc' => $utcDateTime,
-        'local_datetime' => $finalDate . ' ' . $finalTime,
-        'timezone' => $finalTimezone,
-        'logs_inserted' => $logsInserted
+        'message' => 'Combined row inserted into logs'
     ]);
 
 } catch (Throwable $e) {
-    if (
-        $transactionStarted &&
-        isset($conn) &&
-        $conn instanceof mysqli
-    ) {
+    if (isset($conn) && $conn instanceof mysqli) {
         try {
             $conn->rollback();
-        } catch (Throwable $rollbackError) {
-            error_log(
-                'datalogger8 rollback error: ' .
-                $rollbackError->getMessage()
-            );
+        } catch (Throwable $ignored) {
         }
     }
 
-    error_log(
-        'datalogger8 receive_sensor.php failed: ' .
-        $e->getMessage() .
-        ' | cycle_id=' . (string)$cycleId .
-        ' | device_id=' . $deviceId
-    );
+    error_log('receive_sensor.php: ' . $e->getMessage());
 
-    respond(500, [
+    reply(500, [
         'ok' => false,
-        'message' => 'Server could not process the reading'
+        'error' => 'Server processing failed. Check Render logs.'
     ]);
 }
