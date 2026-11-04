@@ -1,4 +1,3 @@
-
 <?php
 /*
  * Data Logger Remote Configuration
