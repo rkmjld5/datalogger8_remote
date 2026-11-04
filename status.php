@@ -1,35 +1,31 @@
+
 <?php
 declare(strict_types=1);
 
 /*
- * Project: datalogger8_remote
- * File: status.php
- *
- * Checks:
- * 1. Database connection.
- * 2. Three ESP controllers.
- * 3. Pending sensor readings.
- * 4. Completed collection cycles.
- * 5. Recent combined records in logs.
+ * DATALOGGER8 REMOTE - STATUS API
  *
  * Database: espdemo2
  * Tables:
- *   logs
  *   sensor_pending8
  *   sensor_cycles8
+ *   logs
+ *
+ * Authentication:
+ *   Render environment variable: ESP_API_TOKEN
+ *   HTTP header: X-API-Token
+ *
+ * Request:
+ *   GET /status.php
+ *
+ * This file only reads database records.
+ * It does not insert, update or delete records.
  */
 
 header('Content-Type: application/json; charset=utf-8');
-header('Cache-Control: no-store');
+header('Cache-Control: no-store, no-cache, must-revalidate');
 
-date_default_timezone_set('UTC');
-
-
-/* ---------------------------------------------------------
-   1. JSON RESPONSE FUNCTION
-   --------------------------------------------------------- */
-
-function statusResponse(int $httpCode, array $data): void
+function statusJson(int $httpCode, array $data): void
 {
     http_response_code($httpCode);
 
@@ -37,204 +33,241 @@ function statusResponse(int $httpCode, array $data): void
         $data,
         JSON_PRETTY_PRINT |
         JSON_UNESCAPED_SLASHES |
-        JSON_UNESCAPED_UNICODE
+        JSON_INVALID_UTF8_SUBSTITUTE
     );
 
     exit;
 }
 
-
 /* ---------------------------------------------------------
-   2. ACCEPT GET REQUESTS ONLY
+   1. Allow GET requests only
    --------------------------------------------------------- */
 
 if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
-
-    header('Allow: GET');
-
-    statusResponse(405, [
+    statusJson(405, [
         'ok' => false,
         'message' => 'GET requests only'
     ]);
 }
 
-
 /* ---------------------------------------------------------
-   3. LOAD DATABASE CONFIGURATION
+   2. Load database configuration
    --------------------------------------------------------- */
 
 require_once __DIR__ . '/config.php';
 
-
 /* ---------------------------------------------------------
-   4. OPTIONAL API TOKEN AUTHENTICATION
+   3. Verify API token
    --------------------------------------------------------- */
 
-/*
- * If ESP_API_TOKEN is configured, callers must provide
- * the same token using the X-API-Token header.
- *
- * This protects status information from public access.
- */
+$serverToken = getenv('ESP_API_TOKEN');
 
-$expectedToken = trim((string)getenv('ESP_API_TOKEN'));
-
-if ($expectedToken !== '') {
-
-    $providedToken = (string)(
-        $_SERVER['HTTP_X_API_TOKEN'] ?? ''
-    );
-
-    if (
-        $providedToken === '' ||
-        !hash_equals($expectedToken, $providedToken)
-    ) {
-
-        statusResponse(401, [
-            'ok' => false,
-            'message' => 'Invalid or missing API token'
-        ]);
-    }
+if ($serverToken === false || trim($serverToken) === '') {
+    statusJson(500, [
+        'ok' => false,
+        'message' => 'ESP_API_TOKEN is not configured on server'
+    ]);
 }
 
+$receivedToken = $_SERVER['HTTP_X_API_TOKEN'] ?? '';
+
+if (
+    $receivedToken === '' ||
+    !hash_equals(trim($serverToken), trim($receivedToken))
+) {
+    statusJson(401, [
+        'ok' => false,
+        'message' => 'Invalid or missing API token'
+    ]);
+}
 
 /* ---------------------------------------------------------
-   5. CHECK DATABASE CONNECTION
+   4. Check database connection
+   --------------------------------------------------------- */
+
+if (!isset($conn) || !($conn instanceof mysqli)) {
+    statusJson(500, [
+        'ok' => false,
+        'message' => 'Database connection unavailable'
+    ]);
+}
+
+/* ---------------------------------------------------------
+   5. Read status information
    --------------------------------------------------------- */
 
 try {
 
-    $databaseResult = $conn->query(
-        'SELECT DATABASE() AS database_name'
+    $conn->set_charset('utf8mb4');
+
+    // Make TIMESTAMP displays consistent with UTC.
+    $conn->query("SET time_zone = '+00:00'");
+
+    $status = [];
+
+    /* -----------------------------------------------------
+       A. Database information
+       ----------------------------------------------------- */
+
+    $status['database'] = [
+        'name' => 'espdemo2',
+        'connection' => 'connected'
+    ];
+
+    /* -----------------------------------------------------
+       B. Overall pending reading count
+       ----------------------------------------------------- */
+
+    $result = $conn->query(
+        "SELECT COUNT(*) AS total
+         FROM sensor_pending8"
     );
 
-    $databaseRow = $databaseResult->fetch_assoc();
+    $row = $result->fetch_assoc();
 
-    $databaseName = $databaseRow['database_name'] ?? '';
+    $status['summary']['total_pending_readings'] =
+        (int)$row['total'];
 
-    if ($databaseName !== 'espdemo2') {
+    $result->free();
 
-        throw new RuntimeException(
-            'Connected database is not espdemo2'
-        );
+    /* -----------------------------------------------------
+       C. Completed and incomplete cycles
+       ----------------------------------------------------- */
+
+    $result = $conn->query(
+        "SELECT
+            COUNT(*) AS total_cycles,
+            COALESCE(SUM(completed = 1), 0) AS completed_cycles,
+            COALESCE(SUM(completed = 0), 0) AS incomplete_cycles
+         FROM sensor_cycles8"
+    );
+
+    $row = $result->fetch_assoc();
+
+    $status['summary']['total_cycles'] =
+        (int)$row['total_cycles'];
+
+    $status['summary']['completed_cycles'] =
+        (int)$row['completed_cycles'];
+
+    $status['summary']['incomplete_cycles'] =
+        (int)$row['incomplete_cycles'];
+
+    $result->free();
+
+    /* -----------------------------------------------------
+       D. Total records in logs
+       ----------------------------------------------------- */
+
+    $result = $conn->query(
+        "SELECT COUNT(*) AS total
+         FROM logs"
+    );
+
+    $row = $result->fetch_assoc();
+
+    $status['summary']['total_logs_records'] =
+        (int)$row['total'];
+
+    $result->free();
+
+    /* -----------------------------------------------------
+       E. Latest reading from each controller
+       ----------------------------------------------------- */
+
+    $latestReadings = [
+        'ESP0001' => null,
+        'ESP0002' => null,
+        'ESP0003' => null
+    ];
+
+    $result = $conn->query(
+        "SELECT
+            cycle_id,
+            device_id,
+            sensor_value,
+            sample_epoch,
+            timezone,
+            received_at
+         FROM sensor_pending8
+         ORDER BY received_at DESC, cycle_id DESC
+         LIMIT 1000"
+    );
+
+    while ($row = $result->fetch_assoc()) {
+
+        $device = $row['device_id'];
+
+        // First row encountered for each device is its latest.
+        if (
+            array_key_exists($device, $latestReadings) &&
+            $latestReadings[$device] === null
+        ) {
+            $latestReadings[$device] = [
+                'cycle_id' => (string)$row['cycle_id'],
+                'device_id' => $device,
+                'sensor_value' => $row['sensor_value'],
+                'sample_epoch' => (string)$row['sample_epoch'],
+                'timezone' => $row['timezone'],
+                'received_at_utc' => $row['received_at']
+            ];
+        }
     }
 
+    $result->free();
+
+    $status['latest_readings_by_device'] = $latestReadings;
 
     /* -----------------------------------------------------
-       6. CHECK NEW PROJECT TABLES
+       F. Latest 20 cycles and their received controllers
        ----------------------------------------------------- */
 
-    $conn->query(
-        'SELECT cycle_id, completed
-         FROM sensor_cycles8
-         LIMIT 1'
+    $recentCycles = [];
+
+    $result = $conn->query(
+        "SELECT
+            c.cycle_id,
+            c.completed,
+            c.created_at,
+            COUNT(p.device_id) AS reading_count,
+            GROUP_CONCAT(
+                p.device_id
+                ORDER BY p.device_id
+                SEPARATOR ','
+            ) AS devices_received
+         FROM sensor_cycles8 AS c
+         LEFT JOIN sensor_pending8 AS p
+             ON p.cycle_id = c.cycle_id
+         GROUP BY
+            c.cycle_id,
+            c.completed,
+            c.created_at
+         ORDER BY c.cycle_id DESC
+         LIMIT 20"
     );
 
-    $conn->query(
-        'SELECT cycle_id, device_id, sensor_value
-         FROM sensor_pending8
-         LIMIT 1'
-    );
+    while ($row = $result->fetch_assoc()) {
 
-
-    /* -----------------------------------------------------
-       7. COUNT PENDING READINGS
-       ----------------------------------------------------- */
-
-    $pendingResult = $conn->query(
-        'SELECT COUNT(*) AS total
-         FROM sensor_pending8'
-    );
-
-    $pendingRow = $pendingResult->fetch_assoc();
-
-    $pendingTotal = (int)(
-        $pendingRow['total'] ?? 0
-    );
-
-
-    /* -----------------------------------------------------
-       8. COUNT COMPLETED CYCLES
-       ----------------------------------------------------- */
-
-    $completedResult = $conn->query(
-        'SELECT COUNT(*) AS total
-         FROM sensor_cycles8
-         WHERE completed = 1'
-    );
-
-    $completedRow = $completedResult->fetch_assoc();
-
-    $completedTotal = (int)(
-        $completedRow['total'] ?? 0
-    );
-
-
-    /* -----------------------------------------------------
-       9. COUNT INCOMPLETE CYCLES
-       ----------------------------------------------------- */
-
-    $incompleteResult = $conn->query(
-        'SELECT COUNT(*) AS total
-         FROM sensor_cycles8
-         WHERE completed = 0'
-    );
-
-    $incompleteRow = $incompleteResult->fetch_assoc();
-
-    $incompleteTotal = (int)(
-        $incompleteRow['total'] ?? 0
-    );
-
-
-    /* -----------------------------------------------------
-       10. GET RECENT CONTROLLER READINGS
-       ----------------------------------------------------- */
-
-    $controllerResult = $conn->query(
-        'SELECT
-            device_id,
-            COUNT(*) AS pending_readings,
-            MAX(received_at) AS last_received
-         FROM sensor_pending8
-         GROUP BY device_id
-         ORDER BY device_id'
-    );
-
-    $controllerActivity = [];
-
-    while ($row = $controllerResult->fetch_assoc()) {
-
-        $controllerActivity[] = [
-            'device_id' => $row['device_id'],
-            'pending_readings' => (int)$row['pending_readings'],
-            'last_received_utc' => $row['last_received']
+        $recentCycles[] = [
+            'cycle_id' => (string)$row['cycle_id'],
+            'completed' => (int)$row['completed'],
+            'reading_count' => (int)$row['reading_count'],
+            'devices_received' => $row['devices_received'] ?? '',
+            'created_at_utc' => $row['created_at']
         ];
     }
 
+    $result->free();
+
+    $status['recent_cycles'] = $recentCycles;
 
     /* -----------------------------------------------------
-       11. COUNT COMBINED LOG RECORDS
+       G. Latest 20 combined records in logs
        ----------------------------------------------------- */
 
-    $logsResult = $conn->query(
-        "SELECT COUNT(*) AS total
-         FROM logs
-         WHERE device_id = 'ESP0001,ESP0002,ESP0003'"
-    );
+    $recentLogs = [];
 
-    $logsRow = $logsResult->fetch_assoc();
-
-    $combinedLogTotal = (int)(
-        $logsRow['total'] ?? 0
-    );
-
-
-    /* -----------------------------------------------------
-       12. GET LAST COMBINED LOG RECORD
-       ----------------------------------------------------- */
-
-    $lastLogResult = $conn->query(
+    $result = $conn->query(
         "SELECT
             id,
             value1,
@@ -246,82 +279,54 @@ try {
             timezone,
             device_id
          FROM logs
-         WHERE device_id = 'ESP0001,ESP0002,ESP0003'
          ORDER BY id DESC
-         LIMIT 1"
+         LIMIT 20"
     );
 
-    $lastLog = $lastLogResult->fetch_assoc();
+    while ($row = $result->fetch_assoc()) {
 
-    if ($lastLog !== null) {
-
-        $lastLog['id'] = (int)$lastLog['id'];
+        $recentLogs[] = [
+            'id' => (string)$row['id'],
+            'value1' => $row['value1'],
+            'value2' => $row['value2'],
+            'value3' => $row['value3'],
+            'date' => $row['Date'],
+            'time' => $row['Time'],
+            'timestamp_utc' => $row['TimeStamp'],
+            'timezone' => $row['timezone'],
+            'device_id' => $row['device_id']
+        ];
     }
 
+    $result->free();
+
+    $status['latest_logs_records'] = $recentLogs;
 
     /* -----------------------------------------------------
-       13. RETURN STATUS
+       H. Server time
        ----------------------------------------------------- */
 
-    statusResponse(200, [
+    $status['server_time_utc'] = gmdate('Y-m-d H:i:s');
+
+    /* -----------------------------------------------------
+       I. Final response
+       ----------------------------------------------------- */
+
+    statusJson(200, [
         'ok' => true,
-
-        'project' => 'datalogger8_remote',
-
-        'server_utc_time' => gmdate(
-            'Y-m-d H:i:s'
-        ),
-
-        'database' => [
-            'name' => $databaseName,
-            'connection' => 'connected'
-        ],
-
-        'tables' => [
-            'logs' => 'available',
-            'sensor_pending8' => 'available',
-            'sensor_cycles8' => 'available'
-        ],
-
-        'controllers' => [
-            'ESP0001' => [
-                'logs_column' => 'value1'
-            ],
-            'ESP0002' => [
-                'logs_column' => 'value2'
-            ],
-            'ESP0003' => [
-                'logs_column' => 'value3'
-            ]
-        ],
-
-        'cycle_status' => [
-            'pending_readings' => $pendingTotal,
-            'completed_cycles' => $completedTotal,
-            'incomplete_cycles' => $incompleteTotal
-        ],
-
-        'controller_activity' => $controllerActivity,
-
-        'combined_logs' => [
-            'total_records' => $combinedLogTotal,
-            'last_record' => $lastLog
-        ]
+        'message' => 'Datalogger8 status retrieved successfully',
+        'status' => $status
     ]);
-
 
 } catch (Throwable $e) {
 
     error_log(
-        'datalogger8 status.php failed: ' .
+        'datalogger8 status.php ERROR: ' .
         $e->getMessage()
     );
 
-    statusResponse(500, [
+    statusJson(500, [
         'ok' => false,
-        'project' => 'datalogger8_remote',
-        'message' => 'Status check failed',
-        'details' => $e->getMessage()
+        'message' => 'Unable to retrieve datalogger status. Check Render logs.'
     ]);
 }
-?>
