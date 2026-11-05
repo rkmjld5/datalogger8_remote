@@ -1,10 +1,5 @@
 <?php
-// receive_sensor3.php
-// Receives readings from ESP0001, ESP0002 and ESP0003.
-// Inserts one combined row into logs after all three arrive.
-
 header('Content-Type: application/json; charset=utf-8');
-
 require_once __DIR__ . '/config.php';
 
 function reply($data, $code = 200) {
@@ -17,19 +12,16 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     reply(['ok' => false, 'message' => 'POST requests only'], 405);
 }
 
-$token = $_SERVER['HTTP_X_API_TOKEN'] ?? '';
+// Authenticate.
+$expectedToken = dataLoggerEnv('ESP_API_TOKEN');
+$receivedToken = $_SERVER['HTTP_X_API_TOKEN'] ?? '';
 
-if (
-    !isset($_ENV['ESP_API_TOKEN']) ||
-    !hash_equals($_ENV['ESP_API_TOKEN'], $token)
-) {
+if ($expectedToken === '' ||
+    !hash_equals($expectedToken, $receivedToken)) {
     reply(['ok' => false, 'message' => 'Invalid API token'], 401);
 }
 
-if (!isset($conn) || !($conn instanceof mysqli)) {
-    reply(['ok' => false, 'message' => 'Database connection unavailable'], 500);
-}
-
+// Read JSON.
 $input = json_decode(file_get_contents('php://input'), true);
 
 if (!is_array($input)) {
@@ -38,15 +30,15 @@ if (!is_array($input)) {
 
 $cycleId = (string)($input['cycle_id'] ?? '');
 $deviceId = (string)($input['device_id'] ?? '');
-$sensorValue = (string)($input['sensor_value'] ?? '');
-$sampleEpoch = (string)($input['sample_epoch'] ?? '0');
-$timezone = (string)($input['timezone'] ?? 'UTC');
+$sensorValue = trim((string)($input['sensor_value'] ?? ''));
+$sampleEpoch = (string)($input['sample_epoch'] ?? '');
+$timezone = trim((string)($input['timezone'] ?? 'UTC'));
+
+$allowedDevices = ['ESP0001', 'ESP0002', 'ESP0003'];
 
 if (!preg_match('/^[0-9]{1,20}$/', $cycleId)) {
     reply(['ok' => false, 'message' => 'Invalid cycle ID'], 400);
 }
-
-$allowedDevices = ['ESP0001', 'ESP0002', 'ESP0003'];
 
 if (!in_array($deviceId, $allowedDevices, true)) {
     reply(['ok' => false, 'message' => 'Invalid device ID'], 400);
@@ -64,29 +56,25 @@ if (strlen($timezone) > 64) {
     reply(['ok' => false, 'message' => 'Invalid timezone'], 400);
 }
 
-$conn->begin_transaction();
-
 try {
+    $conn->begin_transaction();
 
-    // Lock the cycle row so simultaneous controller submissions
-    // cannot create duplicate combined log records.
+    // Lock the cycle row.
     $stmt = $conn->prepare("
-        SELECT completed, created_at
+        SELECT
+            completed,
+            (created_at < DATE_SUB(NOW(), INTERVAL 120 SECOND))
+                AS is_expired
         FROM sensor_cycles3
         WHERE cycle_id = ?
         FOR UPDATE
     ");
-
-    if (!$stmt) {
-        throw new Exception($conn->error);
-    }
 
     $stmt->bind_param('s', $cycleId);
     $stmt->execute();
 
     $result = $stmt->get_result();
     $cycle = $result->fetch_assoc();
-
     $stmt->close();
 
     if (!$cycle) {
@@ -95,9 +83,8 @@ try {
 
     $state = (int)$cycle['completed'];
 
-    // Already completed or expired: do not insert another log.
+    // Do not accept readings for closed cycles.
     if ($state !== 0) {
-
         $conn->commit();
 
         reply([
@@ -108,10 +95,8 @@ try {
         ]);
     }
 
-    // Expire a cycle that has waited too long.
-    $created = strtotime($cycle['created_at']);
-
-    if ($created !== false && (time() - $created) > 120) {
+    // Expire old cycles.
+    if ((int)$cycle['is_expired'] === 1) {
 
         $stmt = $conn->prepare("
             UPDATE sensor_cycles3
@@ -133,7 +118,7 @@ try {
         ]);
     }
 
-    // Store or update this device's reading for this cycle.
+    // Store this controller's reading.
     $stmt = $conn->prepare("
         INSERT INTO sensor_pending3
         (cycle_id, device_id, sensor_value, sample_epoch, timezone)
@@ -144,10 +129,6 @@ try {
             timezone = VALUES(timezone)
     ");
 
-    if (!$stmt) {
-        throw new Exception($conn->error);
-    }
-
     $stmt->bind_param(
         'sssss',
         $cycleId,
@@ -157,13 +138,10 @@ try {
         $timezone
     );
 
-    if (!$stmt->execute()) {
-        throw new Exception($stmt->error);
-    }
-
+    $stmt->execute();
     $stmt->close();
 
-    // Count the distinct controller readings received.
+    // Count readings received.
     $stmt = $conn->prepare("
         SELECT COUNT(*) AS total
         FROM sensor_pending3
@@ -175,14 +153,12 @@ try {
 
     $result = $stmt->get_result();
     $countRow = $result->fetch_assoc();
-
     $stmt->close();
 
     $received = (int)$countRow['total'];
 
-    // Wait until all three controllers have submitted.
+    // Wait for the remaining controllers.
     if ($received < 3) {
-
         $conn->commit();
 
         reply([
@@ -194,7 +170,7 @@ try {
         ]);
     }
 
-    // Retrieve all three readings.
+    // Read all three controller values.
     $stmt = $conn->prepare("
         SELECT device_id, sensor_value, sample_epoch, timezone
         FROM sensor_pending3
@@ -205,7 +181,6 @@ try {
     $stmt->execute();
 
     $result = $stmt->get_result();
-
     $readings = [];
 
     while ($row = $result->fetch_assoc()) {
@@ -214,19 +189,20 @@ try {
 
     $stmt->close();
 
-    // Confirm that all required device IDs are present.
     foreach ($allowedDevices as $requiredDevice) {
-
         if (!isset($readings[$requiredDevice])) {
-            throw new Exception('Missing reading from ' . $requiredDevice);
+            throw new Exception(
+                'Missing reading from ' . $requiredDevice
+            );
         }
     }
 
+    // Map readings to the existing logs columns.
     $value1 = $readings['ESP0001']['sensor_value'];
     $value2 = $readings['ESP0002']['sensor_value'];
     $value3 = $readings['ESP0003']['sensor_value'];
 
-    // Use ESP0001's epoch and timezone for the combined log row.
+    // Use master controller's sample time.
     $masterEpoch = (int)$readings['ESP0001']['sample_epoch'];
     $masterTimezone = $readings['ESP0001']['timezone'];
 
@@ -249,16 +225,12 @@ try {
 
     $logDevice = 'ESP0001,ESP0002,ESP0003';
 
-    // Insert exactly one combined record.
+    // Insert exactly ONE combined record.
     $stmt = $conn->prepare("
         INSERT INTO logs
         (value1, value2, value3, Date, Time, timezone, device_id)
         VALUES (?, ?, ?, ?, ?, ?, ?)
     ");
-
-    if (!$stmt) {
-        throw new Exception($conn->error);
-    }
 
     $stmt->bind_param(
         'sssssss',
@@ -271,15 +243,12 @@ try {
         $logDevice
     );
 
-    if (!$stmt->execute()) {
-        throw new Exception($stmt->error);
-    }
+    $stmt->execute();
 
-    $logId = $conn->insert_id;
-
+    $logId = (string)$conn->insert_id;
     $stmt->close();
 
-    // Mark this cycle completed in the same transaction.
+    // Mark cycle completed.
     $stmt = $conn->prepare("
         UPDATE sensor_cycles3
         SET completed = 1
@@ -287,16 +256,8 @@ try {
           AND completed = 0
     ");
 
-    if (!$stmt) {
-        throw new Exception($conn->error);
-    }
-
     $stmt->bind_param('s', $cycleId);
-
-    if (!$stmt->execute()) {
-        throw new Exception($stmt->error);
-    }
-
+    $stmt->execute();
     $stmt->close();
 
     $conn->commit();
@@ -307,7 +268,7 @@ try {
         'received' => 3,
         'required' => 3,
         'cycle_id' => $cycleId,
-        'log_id' => (string)$logId,
+        'log_id' => $logId,
         'value1' => $value1,
         'value2' => $value2,
         'value3' => $value3,
