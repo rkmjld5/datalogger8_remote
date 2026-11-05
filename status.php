@@ -1,4 +1,3 @@
-
 <?php
 /*
     PROJECT: datalogger8_remote
